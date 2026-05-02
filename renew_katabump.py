@@ -223,6 +223,106 @@ class KatabumpAutoRenew:
                 continue
         return texts
 
+    def _has_altcha(self):
+        try:
+            return bool(self.driver.execute_script("""
+                return !!document.querySelector('altcha-widget') ||
+                       document.body.innerText.includes('ALTCHA') ||
+                       document.body.innerText.includes("I'm not a robot");
+            """))
+        except Exception:
+            return 'ALTCHA' in self._page_text()
+
+    def _handle_altcha(self, context="", timeout=60):
+        """处理 ALTCHA 验证：点击 I'm not a robot，并等待本地 PoW payload 生成。"""
+        if not self._has_altcha():
+            logger.info(f"ℹ️ {self.masked_user} - [{context}] 未发现 ALTCHA，跳过 ALTCHA 步骤")
+            return True
+        logger.info(f"🧩 {self.masked_user} - [{context}] 检测到 ALTCHA，尝试点击 I'm not a robot...")
+
+        clicked = False
+        try:
+            clicked = bool(self.driver.execute_script("""
+                function visible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                }
+                const widgets = Array.from(document.querySelectorAll('altcha-widget'));
+                for (const w of widgets) {
+                    const root = w.shadowRoot || w;
+                    const candidates = [
+                        root.querySelector('input[type="checkbox"]'),
+                        root.querySelector('label'),
+                        root.querySelector('button'),
+                        root.querySelector('[role="checkbox"]')
+                    ].filter(Boolean);
+                    for (const el of candidates) {
+                        try { el.scrollIntoView({block: 'center'}); } catch (e) {}
+                        try { el.click(); return true; } catch (e) {}
+                    }
+                }
+                const inputs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+                for (const el of inputs) {
+                    if (visible(el)) {
+                        try { el.scrollIntoView({block: 'center'}); } catch (e) {}
+                        try { el.click(); return true; } catch (e) {}
+                    }
+                }
+                return false;
+            """))
+        except Exception as e:
+            logger.warning(f"⚠️ {self.masked_user} - [{context}] ALTCHA JS 点击失败: {e}")
+
+        if not clicked:
+            try:
+                checkbox = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox']"))
+                )
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
+                checkbox.click()
+                clicked = True
+            except Exception:
+                try:
+                    label = WebDriverWait(self.driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, "//*[contains(., \"I'm not a robot\")]"))
+                    )
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", label)
+                    label.click()
+                    clicked = True
+                except Exception as e:
+                    logger.error(f"❌ {self.masked_user} - [{context}] ALTCHA 点击失败: {e}")
+                    return False
+
+        logger.info(f"🖱️ {self.masked_user} - [{context}] 已点击 ALTCHA，等待验证完成...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                state_payload = self.driver.execute_script("""
+                    const w = document.querySelector('altcha-widget');
+                    const state = w ? (w.getAttribute('state') || w.state || '') : '';
+                    const payload = document.querySelector("input[name='altcha']")?.value || '';
+                    const text = document.body.innerText || '';
+                    return {state, payload, text};
+                """)
+                state = str(state_payload.get('state') or '').lower()
+                payload = state_payload.get('payload') or ''
+                text = state_payload.get('text') or ''
+                if payload and len(payload) > 20:
+                    logger.info(f"✅ {self.masked_user} - [{context}] ALTCHA 验证已通过 (Payload Ready)")
+                    return True
+                if state == 'verified':
+                    logger.info(f"✅ {self.masked_user} - [{context}] ALTCHA 验证已通过 (State Verified)")
+                    return True
+                if is_not_due_text(text):
+                    logger.info(f"⏳ {self.masked_user} - [{context}] ALTCHA 等待期间检测到未到时间提示")
+                    return True
+            except Exception:
+                pass
+            sleep(1000)
+        logger.warning(f"⚠️ {self.masked_user} - [{context}] ALTCHA 等待超时，未检测到 payload")
+        return False
+
     def process(self):
         logger.info(f"🚀 开始登录账号: {self.masked_user}")
         self.driver.get("https://dashboard.katabump.com/auth/login")
@@ -289,8 +389,16 @@ class KatabumpAutoRenew:
             logger.info(f"⏳ {self.masked_user} - 未到可续期时间: {msg}")
             return STATUS_NOT_DUE, f"⏳ {self.masked_user}\n未到可续期时间：{msg}\n当前到期时间：{initial_expiry or 'Unknown'}"
 
-        # --- 续期弹窗 CF 验证：只有真的出现验证框才处理；出现但过不去才算失败 ---
-        if not self._handle_turnstile("Renew Modal", required=False, timeout=5):
+        # --- 续期弹窗验证：Katabump 当前使用 ALTCHA；如果没有 ALTCHA，再兼容旧的 Turnstile ---
+        if self._has_altcha():
+            if not self._handle_altcha("Renew Modal", timeout=70):
+                modal_text = self._renew_modal_text()
+                if is_not_due_text(modal_text):
+                    msg = extract_not_due_message(modal_text)
+                    logger.info(f"⏳ {self.masked_user} - 未到可续期时间: {msg}")
+                    return STATUS_NOT_DUE, f"⏳ {self.masked_user}\n未到可续期时间：{msg}\n当前到期时间：{initial_expiry or 'Unknown'}"
+                return STATUS_FAILED, f"❌ {self.masked_user}\nRenew 弹窗 ALTCHA 验证未通过，未继续点击最终 Renew。"
+        elif not self._handle_turnstile("Renew Modal", required=False, timeout=5):
             modal_text = self._renew_modal_text()
             if is_not_due_text(modal_text):
                 msg = extract_not_due_message(modal_text)
@@ -317,12 +425,15 @@ class KatabumpAutoRenew:
             
         logger.info(f"⏳ {self.masked_user} - 等待数据更新...")
         sleep(7000 + random.random() * 2000)
+        post_click_text = self._page_text()
+        if post_click_text:
+            logger.info(f"🧾 {self.masked_user} - 点击 Renew 后页面文本摘要: {post_click_text[:700]}")
 
         # 结果核验
         try:
             alert_texts = self._visible_alert_texts()
             combined_alerts = " | ".join(alert_texts)
-            page_text = self._page_text()
+            page_text = post_click_text or self._page_text()
             if is_not_due_text(combined_alerts) or is_not_due_text(page_text):
                 msg = extract_not_due_message(combined_alerts or page_text)
                 logger.info(f"⏳ {self.masked_user} - 未到可续期时间: {msg}")
