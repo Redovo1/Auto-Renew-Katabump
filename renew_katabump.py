@@ -65,12 +65,21 @@ NOT_DUE_PATTERNS = [
     "you will be able to as of",
 ]
 
+SUCCESS_RENEW_PATTERNS = [
+    "your service has been renewed",
+    "service has been renewed",
+]
+
 def normalize_text(text):
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 def is_not_due_text(text):
     lowered = normalize_text(text).lower()
     return any(pattern in lowered for pattern in NOT_DUE_PATTERNS)
+
+def is_success_renew_text(text):
+    lowered = normalize_text(text).lower()
+    return any(pattern in lowered for pattern in SUCCESS_RENEW_PATTERNS)
 
 def extract_not_due_message(text):
     clean = normalize_text(text)
@@ -438,14 +447,17 @@ class KatabumpAutoRenew:
                 msg = extract_not_due_message(combined_alerts or page_text)
                 logger.info(f"⏳ {self.masked_user} - 未到可续期时间: {msg}")
                 return STATUS_NOT_DUE, f"⏳ {self.masked_user}\n未到可续期时间：{msg}\n当前到期时间：{initial_expiry or 'Unknown'}"
+
+            final_expiry_element = self.driver.find_element(By.XPATH, "//div[contains(text(), 'Expiry')]/following-sibling::div")
+            final_expiry = final_expiry_element.text.strip()
+            logger.info(f"✅ {self.masked_user} - 续期后到期时间: {final_expiry}")
+
+            if is_success_renew_text(combined_alerts) or is_success_renew_text(page_text):
+                return STATUS_RENEWED, f"✅ {self.masked_user}\n🎉 续期成功：{initial_expiry or 'Unknown'} → {final_expiry or 'Unknown'}"
             if alert_texts:
                 alertmsg = combined_alerts
                 logger.warning(f"⚠️ {self.masked_user} - 续期失败: {alertmsg}")
                 return STATUS_FAILED, f"❌ {self.masked_user}\n续期失败：{alertmsg}"
-            
-            final_expiry_element = self.driver.find_element(By.XPATH, "//div[contains(text(), 'Expiry')]/following-sibling::div")
-            final_expiry = final_expiry_element.text.strip()
-            logger.info(f"✅ {self.masked_user} - 续期后到期时间: {final_expiry}")
 
             if final_expiry != initial_expiry and len(final_expiry) > 0:
                 return STATUS_RENEWED, f"✅ {self.masked_user}\n🎉 续期成功：{initial_expiry or 'Unknown'} → {final_expiry}"
